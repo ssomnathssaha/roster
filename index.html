@@ -2611,6 +2611,16 @@
     return rest >= minRest;
   }
 
+  function weekendMap(monthKey){
+    var m0 = fromISO(monthKey), n = daysInMonth(m0), map = {};
+    for(var d=0; d<n; d++){ var wd = new Date(m0.getFullYear(), m0.getMonth(), d+1).getDay(); map[d] = wd === 0 || wd === 6; }
+    return map;
+  }
+  function weekendDutyCount(pid, monthKey){
+    var r = (state.rosters[monthKey] || {})[pid] || {}, map = weekendMap(monthKey), c = 0;
+    Object.keys(map).forEach(function(d){ if(map[d] && isAssignedShift(r[d])) c++; });
+    return c;
+  }
   function runAutoAssign(){
     var lmin = parseInt(document.getElementById("aaLocumMin").value, 10);
     var lmax = parseInt(document.getElementById("aaLocumMax").value, 10);
@@ -2621,6 +2631,8 @@
     var monthKey = state.currentMonthStart;
     var total = daysInMonth(fromISO(monthKey));
     var aaT0 = Date.now();
+    // Saturdays & Sundays: kept as free as possible; unavoidable weekend duty is shared equally
+    var WKND = weekendMap(monthKey);
     var snapshot = JSON.parse(JSON.stringify({
       roster: state.rosters[monthKey] || {}, auto: state.autoAssigned[monthKey] || {},
       locumNights: state.locumNights[monthKey] || [], staff: state.staff
@@ -2691,13 +2703,13 @@
     // ---- 2. One randomized attempt ----
     function attempt(){
       var grid = {};
-      var hours = {}, exclCount = {}, locumCount = {}, typeCount = {};
+      var hours = {}, exclCount = {}, locumCount = {}, typeCount = {}, wkCount = {};
       var people = regulars.concat(baseLocums);
       var newLocums = [];
       var autoCells = {};
       people.forEach(function(p){
         grid[p.id] = {};
-        hours[p.id] = 0; exclCount[p.id] = 0; locumCount[p.id] = 0; typeCount[p.id] = {};
+        hours[p.id] = 0; exclCount[p.id] = 0; locumCount[p.id] = 0; typeCount[p.id] = {}; wkCount[p.id] = 0;
         var src = roster[p.id] || {};
         Object.keys(src).forEach(function(d){
           grid[p.id][d] = src[d];
@@ -2707,6 +2719,7 @@
             if(sh.exclusive) exclCount[p.id]++;
             typeCount[p.id][sh.id] = (typeCount[p.id][sh.id] || 0) + 1;
             if(p.type === "locum") locumCount[p.id]++;
+            if(WKND[d]) wkCount[p.id]++;
           }
         });
       });
@@ -2736,6 +2749,7 @@
         if(sh.exclusive) exclCount[p.id]++;
         typeCount[p.id][sh.id] = (typeCount[p.id][sh.id] || 0) + 1;
         if(p.type === "locum") locumCount[p.id]++;
+        if(WKND[d]) wkCount[p.id]++;
         if(!autoCells[p.id]) autoCells[p.id] = {};
         autoCells[p.id][d] = true;
       }
@@ -2749,7 +2763,7 @@
         var g = 0;
         for(var k=d-1; k>=0; k--){
           if(isDutyDay(pid, k) || isLeave(pid, k, grid)) break;
-          g++;
+          if(!WKND[k]) g++;   // a free weekend is wanted, not an idle gap
         }
         return g;
       }
@@ -2776,6 +2790,17 @@
       function rawTc(pid, sh){ return (typeCount[pid] && typeCount[pid][sh.id]) || 0; }
       // counts are scaled by the doctor's target so doctors on leave get proportionally fewer shifts of each type
       function tc(pid, sh){ var t = tgt[pid]; return t != null && t > 0 && t < target ? rawTc(pid, sh) * target / t : rawTc(pid, sh); }
+      // weekend duties, scaled by target so doctors on leave get proportionally fewer
+      function wkc(pid){ var t = tgt[pid]; return t != null && t > 0 && t < target ? wkCount[pid] * target / t : wkCount[pid]; }
+      function avgWk(){
+        if(!regulars.length) return 0;
+        return regulars.reduce(function(a,p){ return a + wkc(p.id); }, 0) / regulars.length;
+      }
+      function fairestWeekend(cands, d){
+        if(!WKND[d] || cands.length < 2) return cands;
+        var mn = Math.min.apply(null, cands.map(function(p){ return wkc(p.id); }));
+        return cands.filter(function(p){ return wkc(p.id) <= mn + 0.5; });
+      }
       function eligibleRegs(sh){ return regulars.filter(function(p){ return allowed(p.id, sh); }); }
       function avgType(sh){
         var el = eligibleRegs(sh);
@@ -2793,9 +2818,13 @@
         s += recentHours(p.id, d) / 24;
         if(sh.exclusive) s += 1.5 * (exclCount[p.id] - avgExcl()) + 3 * (tc(p.id, sh) - avgType(sh));
         if(gapBefore(p.id, d) >= MAX_GAP) s -= 4;
+        if(WKND[d] && p.type === "regular") s += 4 * (wkc(p.id) - avgWk());
+        // same doctor on both days of a weekend leaves others a fully free weekend
+        if(WKND[d] && p.type === "regular" && ((WKND[d-1] && isAssignedShift(val(p.id, d-1))) || (WKND[d+1] && isAssignedShift(val(p.id, d+1))))) s -= 3;
         return s + Math.random() * 1.6;
       }
       function best(cands, d, sh){
+        cands = fairestWeekend(cands, d);
         var bestP = null, bestS = Infinity;
         cands.forEach(function(p){ var sc = score(p, d, sh); if(sc < bestS){ bestS = sc; bestP = p; } });
         return bestP;
@@ -2827,7 +2856,7 @@
       var plannedOpen = {};
       if(nightShift && openMin > 0){
         var dayOrder = [];
-        for(var dd=0; dd<total; dd++) if(!exclusiveHolder(dd)) dayOrder.push({ d:dd, f:freeRegs(dd) + Math.random() * 1.5 });
+        for(var dd=0; dd<total; dd++) if(!exclusiveHolder(dd)) dayOrder.push({ d:dd, f:freeRegs(dd) + Math.random() * 1.5 - (WKND[dd] ? 2 : 0) });
         dayOrder.sort(function(a,b){ return a.f - b.f; });
         var chosen = 0;
         for(var oi2=0; oi2<dayOrder.length && chosen<openMin; oi2++){
@@ -2890,7 +2919,8 @@
           var sup = best(regulars.filter(function(p){ return canTake(p, d, dayShift); }), d, dayShift);
           if(sup) put(sup, d, dayShift); else unsupported++;
         }
-        // (c) pacing + max-gap Day shifts, visiting doctors in random order
+        // (c) pacing + max-gap Day shifts, visiting doctors in random order (never on weekends)
+        if(WKND[d]) continue;
         shuffle(regulars.slice()).forEach(function(p){
           if(!canTake(p, d, dayShift)) return;
           var mustWork = gapBefore(p.id, d) >= MAX_GAP;
@@ -2914,7 +2944,7 @@
               var left = 0, right = 0;
               for(var l=d-1; l>=0 && !isDutyDay(p.id, l); l--) left++;
               for(var rr=d+1; rr<total && !isDutyDay(p.id, rr); rr++) right++;
-              var v = Math.min(left, right) * 2 + Math.max(left, right) * 0.5 - dayShiftCountOn(d) * 1.5 + Math.random();
+              var v = Math.min(left, right) * 2 + Math.max(left, right) * 0.5 - dayShiftCountOn(d) * 1.5 + Math.random() - (WKND[d] ? 100 : 0);
               if(v > bestV){ bestV = v; bestD = d; }
             }
             if(bestD < 0) break;
@@ -2930,6 +2960,7 @@
         var run = 0;
         for(var d=0; d<total; d++){
           if(isDutyDay(p.id, d) || isLeave(p.id, d, grid)){ run = 0; continue; }
+          if(WKND[d]) continue;
           run++;
           if(run > MAX_GAP) gapViol++;
         }
@@ -2957,13 +2988,24 @@
           typeSpread += Math.max.apply(null, cs) - Math.min.apply(null, cs);
         });
       }
-      var cost = shortfall * 20 + gapViol * 30 + unfilled * 200 + unsupported * 60 + dayGaps * 250 +
+      var wkTotal = 0, wkSpread = 0;
+      if(regulars.length){
+        var wks = regulars.map(function(p){ wkTotal += wkCount[p.id]; return wkc(p.id); });
+        wkSpread = Math.max.apply(null, wks) - Math.min.apply(null, wks);
+      }
+      var brokenWkends = 0; // weekends where a doctor works only one of the two days
+      regulars.forEach(function(p){
+        for(var d4=0; d4<total-1; d4++){
+          if(WKND[d4] && WKND[d4+1] && (isAssignedShift(val(p.id, d4)) !== isAssignedShift(val(p.id, d4+1)))) brokenWkends++;
+        }
+      });
+      var cost = brokenWkends * 5 + wkTotal * 6 + wkSpread * 40 + shortfall * 20 + gapViol * 30 + unfilled * 200 + unsupported * 60 + dayGaps * 250 +
                  Math.max(0, openMin - openCount) * 30 + openCount * 2 +
                  newLocums.length * 40 + locumShifts * 8 + weekVar * 1.2 + typeSpread * 45;
 
       return { grid: grid, autoCells: autoCells, newLocums: newLocums, cost: cost, openNights: openNights, openCount: openCount, dayGaps: dayGaps,
                shortfall: shortfall, gapViol: gapViol, unfilled: unfilled, unsupported: unsupported, hours: hours,
-               typeSpread: typeSpread };
+               typeSpread: typeSpread, wkTotal: wkTotal };
     }
 
     var bestRun = null;
@@ -3028,6 +3070,11 @@
     html += "<div class='aa-sum-h'>Status</div>";
     if(ok) html += "<div class='aa-sum-note ok'>✅<span>Every doctor is at their monthly target" + (state.staff.some(function(p){ return p.type !== "locum" && targetFor(p.id) !== state.settings.monthlyTargetHours; }) ? " (leave-adjusted)" : "") + ".</span></div>";
     issues.forEach(function(t){ html += "<div class='aa-sum-note'>⚠️<span>" + escapeHtml(t) + "</span></div>"; });
+    var wkRegs = state.staff.filter(function(p){ return p.type === "regular"; }).map(function(p){ return weekendDutyCount(p.id, monthKey); });
+    if(wkRegs.length){
+      var wkMin = Math.min.apply(null, wkRegs), wkMax = Math.max.apply(null, wkRegs);
+      html += "<div class='aa-sum-note ok'>🗓️<span>Weekends kept as free as possible — each doctor has " + (wkMin === wkMax ? wkMin : wkMin + "–" + wkMax) + " weekend dut" + (wkMax === 1 ? "y" : "ies") + " this month (only the minimum cover).</span></div>";
+    }
     if(openCount) html += "<div class='aa-sum-note loc'>🌙<span>" + openCount + " night(s) left open for a locum — marked 🌙L on the calendar. Tap one to book.</span></div>";
     if(!added && !changed && !removed) html += "<div class='aa-sum-note ok'>ℹ️<span>No changes — the roster was already optimal.</span></div>";
     html += "<div class='aa-sum-h' style='margin-top:12px'>Per doctor</div>";
@@ -3042,7 +3089,7 @@
         "<div class='avatar" + (isLocum ? " locum" : "") + "'>" + initials(o.p.name) + "</div>" +
         "<div class='main'><div class='nm'>" + escapeHtml(o.p.name) + "</div>" +
         "<div class='hr'>" + (isLocum ? "Locum · " + locumShiftCount(o.p.id) + "/" + state.settings.locumMaxShifts + " nights" :
-          o.hB + "h → <b>" + o.hA + "h</b> / " + tgt + "h" + (leaveDayCount(o.p.id) ? " · 🌴 " + leaveDayCount(o.p.id) : "")) +
+          o.hB + "h → <b>" + o.hA + "h</b> / " + tgt + "h" + (leaveDayCount(o.p.id) ? " · 🌴 " + leaveDayCount(o.p.id) : "") + " · 🗓️ " + weekendDutyCount(o.p.id, monthKey) + " wknd") +
           (o.touched ? " · " + o.touched + " day" + (o.touched === 1 ? "" : "s") + " changed" : "") + "</div>" +
         (tgt ? "<div class='aa-sum-bar'><i class='" + barCls + "' style='width:" + pct + "%'></i></div>" : "") +
         (mixHtml ? "<div class='aa-sum-mix'>" + mixHtml + "</div>" : "") + "</div>" +
